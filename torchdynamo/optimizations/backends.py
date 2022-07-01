@@ -118,6 +118,16 @@ def static_runtime(subgraph):
     return subgraph.wrap_returns(static_module)
 
 
+@create_backend
+def nebullvm(subgraph):
+    from nebullvm import optimize_torch_model
+    model = subgraph.model
+    inputs = subgraph.example_inputs
+    bs = len(inputs)
+    input_sizes = [tuple(x.shape) for x in inputs[0]]
+    return optimize_torch_model(model=model, save_dir='.', batch_size=bs, input_sizes=input_sizes)
+
+
 def onnxrt_common(subgraph, provider, onnx_filename=None):
     import onnxruntime
 
