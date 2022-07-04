@@ -150,6 +150,8 @@ def check_model(self: TestCase, model, example_inputs, tol=1e-4, check_lowp=True
         if hasattr(model, "to"):
             model = model.to(torch.half)
 
+    torchinductor.metrics.reset()
+
     @torchdynamo.optimize_assert(functools.partial(compile_fx, cudagraphs=False))
     def run(*ex):
         return model(*ex)
@@ -409,6 +411,7 @@ class CommonTemplate:
                 torch.randn(26),
             ),
         )
+        self.assertEqual(torchinductor.metrics.generated_kernel_count, 1)
 
     def test_sum1(self):
         def fn(a, b):
@@ -452,6 +455,16 @@ class CommonTemplate:
             return (f,)
 
         self.common(fn, (torch.randn(1, 17, 8, 9),))
+
+    def test_multilayer_low_prec(self):
+        # fp16 nyi for cpu
+        if self.device == "cpu":
+            raise unittest.SkipTest("requires CUDA")
+
+        def fn(a):
+            return torch.mean(a)
+
+        self.common(fn, ((torch.rand((10, 3, 352, 352), dtype=torch.float16),)))
 
     def test_min_max_reduction(self):
         def fn(a, b):
@@ -1100,6 +1113,15 @@ class CommonTemplate:
             (torch.randn([16, 16]),),
         )
 
+    def test_cos(self):
+        def fn(x):
+            return aten.cos(x) + 2, aten.cos(x + 1)
+
+        self.common(
+            fn,
+            (torch.randn([16, 16]),),
+        )
+
     def test_repeat(self):
         def fn(x):
             return (
@@ -1540,6 +1562,8 @@ class CommonTemplate:
             ),
         )
 
+    # https://github.com/pytorch/torchdynamo/issues/467
+    @patch.object(torchdynamo.config, "fake_tensor_propagation", False)
     def test_cudnn_rnn(self):
         if self.device == "cpu":
             raise unittest.SkipTest("requires CUDA")

@@ -28,14 +28,26 @@ inplace_buffers = False
 # codegen benchmark harness
 benchmark_harness = True
 
+# control store vs recompute heuristic
+realize_reads_threshold = 4
+realize_bytes_threshold = 2000
+
 
 # config specific to codegen/cpp.pp
 class cpp:
     threads = -1  # set to cpu_count()
     simdlen = None
     min_chunk_size = 4096
-    cxx = ("g++-10", "g++")
-    # cxx = "clang++-12"
+    cxx = (
+        None,  # download gcc12 from conda-forge if conda is installed
+        "g++-12",
+        "g++-11",
+        "g++-10",
+        "clang++-12",
+        "clang++-11",
+        "clang++-10",
+        "g++",
+    )
 
 
 # config specific to codegen/triton.py
@@ -56,6 +68,7 @@ class triton:
     # limit tiling dimensions
     # Disable tiling until we figure out how tiling and fusion work together
     max_tiles = 1
+    tile_broadcasting = False
 
     # put each kernel in its own file
     many_files = False

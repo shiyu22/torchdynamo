@@ -3,11 +3,13 @@ import importlib
 import json
 import os
 import unittest
+from unittest.mock import patch
 
 import torch
 
 import torchdynamo
 from torchdynamo.optimizations import backends
+from torchdynamo.optimizations.analysis import has_mutation
 from torchdynamo.optimizations.inference import offline_autotuner
 from torchdynamo.optimizations.log_args import conv_args_analysis
 from torchdynamo.optimizations.normalize import Inplacifier
@@ -74,6 +76,20 @@ class TestOptimizations(torchdynamo.testing.TestCase):
         self.assertIn("inplace=True", code)
         self.assertIn("out=linear_1", code)
 
+    def test_has_mutation(self):
+        gm = torch.fx.symbolic_trace(Seq())
+        self.assertFalse(has_mutation(gm, torch.rand([10, 10])))
+
+        class Mutating(torch.nn.Module):
+            def __init__(self):
+                super(Mutating, self).__init__()
+
+            def forward(self, arg):
+                return arg.add_(1)
+
+        gm = torch.fx.symbolic_trace(Mutating())
+        self.assertTrue(has_mutation(gm, torch.rand([10, 1, 1, 1])))
+
     def test_example_inputs(self):
         def fn(a, bc, d):
             b, c = bc
@@ -97,6 +113,7 @@ class TestOptimizations(torchdynamo.testing.TestCase):
         self.assertTrue(same(r1, r2))
         self.assertTrue(same(r1, r3))
 
+    @patch.object(torchdynamo.config, "fake_tensor_propagation", False)
     @unittest.skipIf(not has_functorch(), "requires functorch")
     def test_log_conv_args(self):
         model = Conv_Bn_Relu(3, 32, kernel_size=3, stride=1)
@@ -114,8 +131,8 @@ class TestOptimizations(torchdynamo.testing.TestCase):
         self.assertTrue(os.path.exists(filename))
         with open(filename) as f:
             args_dict = json.load(f)
-            self.assertIn("convolution", args_dict.keys())
-            conv_args_dict = args_dict["convolution"]
+            self.assertIn("convolution_default", args_dict.keys())
+            conv_args_dict = args_dict["convolution_default"]
             self.assertIn("input", conv_args_dict.keys())
             self.assertIn("weight", conv_args_dict.keys())
             self.assertIn("bias", conv_args_dict.keys())

@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 import gc
 import importlib
 import logging
@@ -22,6 +23,9 @@ torch.backends.cuda.matmul.allow_tf32 = True
 
 os.environ["KALDI_ROOT"] = "/tmp"  # avoids some spam
 for torchbench_dir in (
+    "../torchbenchmark",
+    "../torchbench",
+    "../benchmark",
     "../../torchbenchmark",
     "../../torchbench",
     "../../benchmark",
@@ -29,6 +33,7 @@ for torchbench_dir in (
     if exists(torchbench_dir):
         break
 assert exists(torchbench_dir), "../../torchbenchmark does not exist"
+original_dir = abspath(os.getcwd())
 torchbench_dir = abspath(torchbench_dir)
 os.chdir(torchbench_dir)
 sys.path.append(torchbench_dir)
@@ -95,10 +100,7 @@ REQUIRE_EVEN_HIGHER_TOLERANCE = {
 
 
 # non-deterministic output / cant check correctness
-NONDETERMINISTIC = {
-    "pyhpc_turbulent_kinetic_energy",
-    "pyhpc_isoneutral_mixing",
-}
+NONDETERMINISTIC = set()
 
 
 # These benchmarks took >600s on an i9-11900K CPU
@@ -152,6 +154,10 @@ TORCHINDUCTOR_NOT_YET_WORKING = {
     # LLVM ERROR: Broken function found, compilation aborted!
     # torch.randn missing
     "hf_Reformer",
+    # as_strided issue
+    "hf_Longformer",
+    # out of memory
+    "timm_efficientdet",
 }
 
 
@@ -182,9 +188,6 @@ SKIP = {
 
 
 class TorchBenchmarkRunner(BenchmarkRunner):
-    def __init__(self):
-        super(TorchBenchmarkRunner, self).__init__()
-
     @property
     def skip_models(self):
         return SKIP
@@ -321,4 +324,4 @@ if __name__ == "__main__":
 
     logging.basicConfig(level=logging.WARNING)
     warnings.filterwarnings("ignore")
-    main(TorchBenchmarkRunner())
+    main(TorchBenchmarkRunner(), original_dir)

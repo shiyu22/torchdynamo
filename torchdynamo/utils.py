@@ -1,12 +1,15 @@
 import collections
 import contextlib
+import copy
 import dataclasses
 import functools
 import gc
 import inspect
 import itertools
-import logging
+import logging.config
+import math
 import operator
+import os
 import re
 import sys
 import time
@@ -31,6 +34,40 @@ counters = collections.defaultdict(collections.Counter)
 troubleshooting_url = (
     "https://github.com/pytorch/torchdynamo/blob/main/TROUBLESHOOTING.md"
 )
+
+
+LOGGING_CONFIG = {
+    "version": 1,
+    "formatters": {
+        "torchdynamo_format": {"format": "%(levelname)s %(name)s: %(message)s"},
+    },
+    "handlers": {
+        "torchdynamo_console": {
+            "class": "logging.StreamHandler",
+            "level": "DEBUG",
+            "formatter": "torchdynamo_format",
+            "stream": "ext://sys.stdout",
+        },
+    },
+    "loggers": {
+        "torchdynamo": {
+            "level": "DEBUG",
+            "handlers": ["torchdynamo_console"],
+            "propagate": False,
+        },
+        "torchinductor": {
+            "level": "DEBUG",
+            "handlers": ["torchdynamo_console"],
+            "propagate": False,
+        },
+    },
+}
+
+
+@functools.lru_cache(None)
+def init_logging():
+    if "PYTEST_CURRENT_TEST" not in os.environ:
+        logging.config.dictConfig(LOGGING_CONFIG)
 
 
 def count_calls(g: fx.Graph):
@@ -72,13 +109,14 @@ class ExactWeakKeyDictionary:
         self.values[idx] = value
 
     def _remove_id(self, idx):
-        if idx in self.refs:
+        if idx in self.values:
             del self.values[idx]
+        if idx in self.refs:
             del self.refs[idx]
 
     def clear(self):
-        self.values.clear()
         self.refs.clear()
+        self.values.clear()
 
 
 def istype(obj, allowed_types):
@@ -217,6 +255,13 @@ def clone_input(x):
 
 
 def clone_inputs(example_inputs):
+    if isinstance(example_inputs, dict):
+        res = dict(example_inputs)
+        for key, value in res.items():
+            assert isinstance(value, torch.Tensor)
+            res[key] = clone_input(value)
+        return res
+
     res = list(example_inputs)
     for i in range(len(res)):
         if isinstance(res[i], torch.Tensor):
@@ -360,7 +405,9 @@ def rot_n_helper(n):
 def is_safe_constant(v):
     if istype(v, (tuple, frozenset)):
         return all(map(is_safe_constant, v))
-    return istype(v, (types.CodeType, int, float, bool, str, bytes, type(None), slice))
+    return istype(
+        v, (types.CodeType, int, float, bool, str, bytes, type(None), slice, type(type))
+    )
 
 
 def check_constant_args(args, kwargs):
@@ -396,6 +443,36 @@ def rename_implicit(v):
     return v
 
 
+# FakeTensors were introduced after pytorch 1.12, so gate their use
+# to allow pytorch 1.12 to work
+fake_tensors_available = True
+try:
+    from torch._subclasses import FakeTensorMode  # noqa: F401
+    from torch._subclasses import UnsupportedFakeTensorException
+
+    def wrap_fake_exception(fn):
+        try:
+            return fn()
+        except UnsupportedFakeTensorException as e:
+            raise torchdynamo.exc.FakeTensorError(
+                f"Unsupported: {e.reason} with fake tensor propagation. "
+                "Run with config.fake_tensor_propagation=False"
+            ) from e
+
+    def wrap_to_fake_tensor(e, fake_mode):
+        if type(e) in (torch.Tensor, torch.nn.Parameter):
+            return wrap_fake_exception(lambda: fake_mode.from_tensor(e))
+        else:
+            return e
+
+    def deepcopy_to_fake_tensor(obj, fake_mode):
+        with torch._subclasses.fake_tensor.FakeCopyMode(fake_mode):
+            return wrap_fake_exception(lambda: copy.deepcopy(obj))
+
+except ImportError:
+    fake_tensors_available = False
+
+
 def same(a, b, cos_similarity=False, tol=1e-4, equal_nan=False):
     """Check correctness to see if a and b match"""
     if isinstance(a, (list, tuple, torch.nn.ParameterList, torch.Size)):
@@ -429,8 +506,10 @@ def same(a, b, cos_similarity=False, tol=1e-4, equal_nan=False):
             return res >= 0.99
         else:
             return torch.allclose(a, b, atol=tol, rtol=tol, equal_nan=equal_nan)
-    elif isinstance(a, (str, int, float, type(None), bool, torch.device)):
+    elif isinstance(a, (str, int, type(None), bool, torch.device)):
         return a == b
+    elif isinstance(a, float):
+        return math.isclose(a, b, rel_tol=tol, abs_tol=tol)
     elif is_numpy_int_type(a) or is_numpy_float_type(a):
         return (type(a) is type(b)) and (a == b)
     elif type(a).__name__ in (

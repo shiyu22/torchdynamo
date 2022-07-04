@@ -1,4 +1,6 @@
+import contextlib
 import copy
+import functools
 import itertools
 import numbers
 import operator
@@ -8,7 +10,17 @@ from typing import List
 
 import torch.fx
 import torch.random
+
+from ..utils import fake_tensors_available
+
+if fake_tensors_available:
+    from torch._subclasses import FakeTensor
+    from ..utils import wrap_to_fake_tensor
+    from ..utils import deepcopy_to_fake_tensor
+
 from torch.fx.immutable_collections import immutable_list
+from torch.utils._python_dispatch import enable_torch_dispatch_mode
+from torch.utils._pytree import tree_map
 
 from torchdynamo.guards import GuardBuilder
 
@@ -65,45 +77,88 @@ class TensorVariable(VariableTracker):
 
         return torch.fx.node.map_arg((node.args, node.kwargs), visit)
 
+    @staticmethod
+    def run_proxy(proxy, args, kwargs, nnmodule):
+        op = proxy.node.op
+        if op == "call_function":
+            return proxy.node.target(*args, **kwargs)
+        elif op == "call_method":
+            return getattr(args[0], proxy.node.target)(*args[1:], **kwargs)
+        elif op == "call_module":
+            assert nnmodule is not None
+            return nnmodule(*args, **kwargs)
+        assert False, op
+
     @classmethod
     def create(cls, tx, proxy, example_value=None, nnmodule=None, **options):
         if "guards" in options:
             tx.output.guards.update(options["guards"])
+
         assert "example_value" not in proxy.node.meta
         if not config.dynamic_propagation:
             if isinstance(example_value, torch.Tensor):
                 options.update(cls.specialize(example_value))
             return cls(proxy, **options)
 
+        use_fake_tensors = fake_tensors_available and config.fake_tensor_propagation
+        if use_fake_tensors:
+            fake_wrapper = functools.partial(
+                wrap_to_fake_tensor, fake_mode=tx.fake_mode
+            )
+            # python errors if the import isnt here
+            from ..utils import wrap_fake_exception
+        else:
+
+            def wrap_fake_exception(func):
+                return func()
+
         with preserve_rng_state():
             if example_value is None:
                 op = proxy.node.op
                 args, kwargs = cls.propagate_args_kwargs(proxy.node)
-                if op not in ["call_function", "call_method", "call_module"]:
-                    assert False, op
+                if use_fake_tensors:
+                    args = tree_map(fake_wrapper, args)
+                    kwargs = tree_map(fake_wrapper, kwargs)
+                    if op == "call_module" and not is_lazy_module(nnmodule):
+                        nnmodule = deepcopy_to_fake_tensor(nnmodule, tx.fake_mode)
+
+                    def context():
+                        return enable_torch_dispatch_mode(tx.fake_mode)
+
+                else:
+                    context = contextlib.nullcontext
+                    if op == "call_module" and not is_lazy_module(nnmodule):
+                        nnmodule = copy.deepcopy(nnmodule)
+
+                if op == "call_module" and is_lazy_module(nnmodule):
+                    assert nnmodule is not None
+                    # In the case of a lazy module, we want to run
+                    # the pre-hooks which initialize it
+                    example_value = nnmodule(*args, **kwargs)
                 try:
-                    if op == "call_function":
-                        example_value = proxy.node.target(*args, **kwargs)
-                    elif op == "call_method":
-                        example_value = getattr(args[0], proxy.node.target)(
-                            *args[1:], **kwargs
+                    with context():
+                        example_value = wrap_fake_exception(
+                            lambda: cls.run_proxy(proxy, args, kwargs, nnmodule)
                         )
-                    elif op == "call_module":
-                        assert nnmodule is not None
-                        # In the case of a lazy module, we want to run
-                        # the pre-hooks which initialize it
-                        if is_lazy_module(nnmodule):
-                            example_value = nnmodule(*args, **kwargs)
-                        else:
-                            example_value = copy.deepcopy(nnmodule)(*args, **kwargs)
                 except RuntimeError as e:
-                    # Track the assertion when the pytorch execution raises
-                    # assertion
                     raise TorchRuntimeError() from e
+            else:
+                if use_fake_tensors:
+                    example_value = fake_wrapper(example_value)
 
         if isinstance(example_value, torch.Tensor):
-            proxy.node.meta["example_value"] = clone_tensor(example_value)
-            options.update(cls.specialize(example_value))
+            # tensor subclasses will not be converted to FakeTensors and need to be cloned
+            if not use_fake_tensors or not isinstance(example_value, FakeTensor):
+                example_value = clone_tensor(example_value)
+            proxy.node.meta["example_value"] = example_value
+            specialized_props = cls.specialize(example_value)
+            if use_fake_tensors and isinstance(example_value, FakeTensor):
+                specialized_props["class_type"] = (
+                    torch.nn.Parameter
+                    if isinstance(example_value, torch.nn.Parameter)
+                    else torch.Tensor
+                )
+            options.update(specialized_props)
             return cls(proxy, **options)
         elif (
             istype(example_value, (torch.Size, int, bool, float))
@@ -172,8 +227,13 @@ class TensorVariable(VariableTracker):
             and proxy.node.target == "item"
             and config.capture_scalar_outputs
         ):
-            return UnspecializedPrimitiveVariable.create(
-                tx=tx, proxy=proxy, example_value=torch.tensor(example_value)
+            return UnspecializedPythonVariable.create(
+                tx=tx,
+                proxy=proxy,
+                example_value=torch.tensor(example_value),
+                raw_value=example_value,
+                need_unwrap=False,
+                **options,
             )
         else:
             assert (
@@ -546,10 +606,41 @@ class TensorWithTFOverrideVariable(VariableTracker):
             return tx.inline_user_function_return(tf_func_var, tf_args, {})
 
 
-class UnspecializedPrimitiveVariable(TensorVariable):
+class UnspecializedNumpyVariable(TensorVariable):
     """
-    This is a 1-element tensor represents unspecialized primitive type,
-    e.g, int, float, np.int, np.float, etc
+    This is a 1-element tensor represents unspecialized numpy float/int.
     """
 
-    pass
+    def __init__(self, proxy: torch.fx.Proxy, **kwargs):
+        raw_value = kwargs.pop("raw_value", True)
+        super(UnspecializedNumpyVariable, self).__init__(proxy, **kwargs)
+        self.raw_value = raw_value
+
+    @classmethod
+    def from_tensor_variable(cls, tensor_variable, raw_value):
+        # Convert a `TensorVariable` instance into an `UnspecializedNumpyVariable` instance.
+        return UnspecializedNumpyVariable(
+            **dict(tensor_variable.__dict__), raw_value=raw_value
+        )
+
+
+class UnspecializedPythonVariable(TensorVariable):
+    """
+    This is a 1-element tensor represents unspecialized python float/int.
+    """
+
+    def __init__(self, proxy: torch.fx.Proxy, **kwargs):
+        raw_value = kwargs.pop("raw_value", True)
+        need_unwrap = kwargs.pop("need_unwrap", True)
+        super(UnspecializedPythonVariable, self).__init__(proxy, **kwargs)
+        self.raw_value = raw_value
+        self.need_unwrap = need_unwrap
+
+    @classmethod
+    def from_tensor_variable(cls, tensor_variable, raw_value, need_unwrap=True):
+        # Convert a `TensorVariable` instance into an `UnspecializedPythonVariable` instance.
+        return UnspecializedPythonVariable(
+            **dict(tensor_variable.__dict__),
+            raw_value=raw_value,
+            need_unwrap=need_unwrap,
+        )
