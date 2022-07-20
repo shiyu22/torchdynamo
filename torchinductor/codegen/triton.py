@@ -14,6 +14,7 @@ import torch
 from .. import codecache
 from .. import config
 from .. import ir
+from ..utils import has_triton_libdevice
 from ..utils import sympy_product
 from ..virtualized import V
 from ..virtualized import ops
@@ -92,34 +93,8 @@ class TritonOverrides(OpOverrides):
         return f"tl.sqrt({x})"
 
     @staticmethod
-    def log(x):
-        # workaround https://github.com/openai/triton/issues/543
-        return f"tl.log({x}.to(tl.float32))"
-
-    @staticmethod
-    def isinf(x):
-        return f"{x}+1 == {x}"
-
-    @staticmethod
-    def isnan(x):
-        return f"{x} != {x}"
-
-    @staticmethod
     def relu(x):
         return ops.maximum("0", x)
-
-    @staticmethod
-    def round(x):
-        return f"tl.where({x}<0, {x}-0.5, {x}+0.5).to(tl.int32).to(tl.float32)"
-
-    @staticmethod
-    def floor(x):
-        tmp = ops.trunc(x)
-        return f"tl.where({tmp}>{x}, {tmp}-1, {tmp})"
-
-    @staticmethod
-    def trunc(x):
-        return f"{x}.to(tl.int32).to(tl.float32)"
 
     @staticmethod
     def minimum(a, b):
@@ -149,6 +124,10 @@ class TritonOverrides(OpOverrides):
         return f"tl.cos({x})"
 
     @staticmethod
+    def sin(x):
+        return f"tl.sin({x})"
+
+    @staticmethod
     def index_expr(expr, dtype):
         return V.kernel.indexing(expr)[0]
 
@@ -163,6 +142,50 @@ class TritonOverrides(OpOverrides):
     @staticmethod
     def rand(seed, offset):
         return f"tl.rand({seed}, {offset})"
+
+    @staticmethod
+    def log(x):
+        if has_triton_libdevice():
+            return f"tl.libdevice.log({x}) if {x}.dtype is tl.float64 else tl.log({x})"
+        else:
+            # workaround https://github.com/openai/triton/issues/543
+            return f"tl.log({x}.to(tl.float32))"
+
+    @staticmethod
+    def isinf(x):
+        if has_triton_libdevice():
+            return f"tl.libdevice.isinfd({x}) if {x}.dtype is tl.float64 else tl.libdevice.isinff({x})"
+        else:
+            return f"{x}+1 == {x}"
+
+    @staticmethod
+    def isnan(x):
+        if has_triton_libdevice():
+            return f"tl.libdevice.isnand({x}) if {x}.dtype is tl.float64 else tl.libdevice.isnanf({x})"
+        else:
+            return f"{x} != {x}"
+
+    @staticmethod
+    def round(x):
+        if has_triton_libdevice():
+            return f"tl.libdevice.nearbyint({x})"
+        else:
+            return f"tl.where({x}<0, {x}-0.5, {x}+0.5).to(tl.int32).to(tl.float32)"
+
+    @staticmethod
+    def floor(x):
+        if has_triton_libdevice():
+            return f"tl.libdevice.floor({x})"
+        else:
+            tmp = ops.trunc(x)
+            return f"tl.where({tmp}>{x}, {tmp}-1, {tmp})"
+
+    @staticmethod
+    def trunc(x):
+        if has_triton_libdevice():
+            return f"tl.libdevice.trunc({x})"
+        else:
+            return f"{x}.to(tl.int32).to(tl.float32)"
 
 
 @dataclasses.dataclass
@@ -533,16 +556,18 @@ class TritonKernel(Kernel):
 
     def simplify_indexing(self, expr: sympy.Expr):
         expr = V.graph.sizevars.simplify_with_ranges(expr, self.var_ranges())
+        sorted_expr_symbols = sorted(expr.free_symbols, key=lambda s: s.name)
         nodes = [
             self.range_tree_nodes[sym]
-            for sym in expr.free_symbols
+            for sym in sorted_expr_symbols
             if sym in self.range_tree_nodes
         ]
         if nodes:
             nodes.sort(key=lambda x: x.depth)
             expr = nodes[-1].simplify(expr)
+            sorted_expr_symbols = sorted(expr.free_symbols, key=lambda s: s.name)
 
-        for sym in expr.free_symbols:
+        for sym in sorted_expr_symbols:
             if sym in self.range_tree_nodes:
                 self.range_tree_nodes[sym].codegen()
 
@@ -566,15 +591,17 @@ class TritonKernel(Kernel):
         if upcast:
             line += ".to(tl.float32)"
 
-        if self.inside_reduction and "rmask" not in mask:
+        if self.inside_reduction and "rmask" not in mask and self.loads != self.compute:
             # can lift a common load outside of reduction loop
+            # One exception is when this is invoked inside of an indirect_load,
+            # because there may be dependency, Kernel.indirect_load sets self.loads
+            # to self.compute which we can use as a checking here.
             tmp = self.cse.generate(self.body, line)
         else:
             tmp = self.cse.generate(self.loads, line)
 
         if not self.inside_reduction or "rmask" not in mask:
             self.outside_loop_vars.add(tmp)
-
         return tmp
 
     def store(self, name, index, value, mode=None):
@@ -788,6 +815,19 @@ class TritonScheduling:
     def group_fn(self, sizes):
         return tuple(V.graph.sizevars.simplify(sympy_product(s)) for s in sizes)
 
+    def group_fn_NHW_C(self, sizes):
+        # group to size of NHW, C for 4d tensor
+        group = ()
+        for s in sizes:
+            if len(s) == 4:
+                group += (
+                    V.graph.sizevars.simplify(sympy_product([s[0], s[2], s[3]])),
+                    s[1],
+                )
+            else:
+                group += (V.graph.sizevars.simplify(sympy_product(s)),)
+        return group
+
     def codegen(self, *groups):
         wrapper = V.graph.wrapper_code
         scheduler = self.scheduler
@@ -844,11 +884,19 @@ class TritonScheduling:
                         except CantSplit:
                             reschedule.append(node)
 
-        kernel_name = wrapper.next_kernel_name()
         if config.triton.many_files:
+            kernel_name = wrapper.next_kernel_name()
             wrapper.define_kernel(kernel_name, kernel.codegen_kernel())
         else:
-            wrapper.header.splice(kernel.codegen_kernel(kernel_name))
+            src_code = kernel.codegen_kernel("{kernel_name}")
+            if src_code in wrapper.kernels:
+                kernel_name = wrapper.kernels[src_code]
+            else:
+                kernel_name = wrapper.next_kernel_name()
+                wrapper.kernels[src_code] = kernel_name
+                code = src_code.format(kernel_name=kernel_name)
+                wrapper.header.splice(code)
+
         kernel.call_kernel(wrapper, kernel_name)
 
         scheduler.enqueue(reschedule)

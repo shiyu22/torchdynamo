@@ -32,6 +32,7 @@ from torchdynamo.optimizations.log_args import conv_args_analysis
 from torchdynamo.optimizations.python_key import python_key
 from torchdynamo.optimizations.training import aot_autograd_debug_strategy1
 from torchdynamo.optimizations.training import aot_autograd_nnc_strategy
+from torchdynamo.optimizations.training import aot_autograd_prims_nvfuser_strategy
 from torchdynamo.optimizations.training import aot_autograd_speedup_strategy
 from torchdynamo.profiler import Profiler
 from torchdynamo.profiler import fx_insert_profiling
@@ -377,7 +378,10 @@ def baselines(models, model_iter_fn, example_inputs, args):
     for rep in range(args.repeat):
         for idx, (name, model) in enumerate(models):
             if model is not None:
-                timings[rep, idx] = timed(model, model_iter_fn, example_inputs)
+                try:
+                    timings[rep, idx] = timed(model, model_iter_fn, example_inputs)
+                except Exception:
+                    pass
     pvalue = [
         ttest_ind(timings[:, 0], timings[:, i]).pvalue
         for i in range(1, timings.shape[1])
@@ -414,6 +418,17 @@ def speedup_experiment_ts(args, model_iter_fn, model, example_inputs):
 
     Writes to ./baseline_ts.csv
     """
+    if args.training:
+        return baselines(
+            [
+                ("eager", model),
+                ("ts", try_script(model, example_inputs)),
+            ],
+            model_iter_fn,
+            example_inputs,
+            args,
+        )
+
     return baselines(
         [
             ("eager", model),
@@ -533,15 +548,14 @@ def cast_to_fp16(model, inputs):
     # cast model and inputs to fp16
     model = model.half()
 
-    inputs = tuple(
-        tree_map(
-            lambda x: x.to(torch.float16)
-            if getattr(x, "dtype", None) == torch.float32
-            or getattr(x, "dtype", None) == torch.float64
-            else x,
-            inputs,
-        )
+    inputs = tree_map(
+        lambda x: x.to(torch.float16)
+        if getattr(x, "dtype", None) == torch.float32
+        or getattr(x, "dtype", None) == torch.float64
+        else x,
+        inputs,
     )
+
     # Disable this part temporarily. Further evaluation needed
     # TRT does not support int64. Some model does need it like Super_SloMo
     # if current_name != "Super_SloMo" and current_name != "fastNLP_Bert":
@@ -560,15 +574,14 @@ def cast_to_fp32(model, inputs):
     # cast model and inputs to fp16
     model = model.to(torch.float32)
 
-    inputs = tuple(
-        tree_map(
-            lambda x: x.to(torch.float32)
-            if getattr(x, "dtype", None) == torch.float16
-            or getattr(x, "dtype", None) == torch.float64
-            else x,
-            inputs,
-        )
+    inputs = tree_map(
+        lambda x: x.to(torch.float32)
+        if getattr(x, "dtype", None) == torch.float16
+        or getattr(x, "dtype", None) == torch.float64
+        else x,
+        inputs,
     )
+
     return model, inputs
 
 
@@ -637,7 +650,7 @@ class BenchmarkRunner:
         return set()
 
     @property
-    def get_tolerance(self, is_training, current_device, name):
+    def get_tolerance_and_cosine_flag(self, is_training, current_device, name):
         raise NotImplementedError()
 
     def run_one_model(
@@ -649,18 +662,18 @@ class BenchmarkRunner:
         example_inputs,
         optimize_ctx,
         experiment,
-        cos_similarity=False,
         skip_accuracy_check=False,
     ):
         t0 = time.perf_counter()
-        tolerance = self.get_tolerance(is_training, current_device, name)
+        tolerance, cos_similarity = self.get_tolerance_and_cosine_flag(
+            is_training, current_device, name
+        )
         with self.pick_grad(name, is_training):
             mode = "train" if is_training else "eval"
             sys.stdout.write(f"{current_device:4} {mode:5} {current_name:34} ")
             sys.stdout.flush()
             for submod in itertools.chain([model], model.modules()):
                 assert not torchdynamo.utils.is_jit_model(submod)
-
             torch.manual_seed(1337)
             correct_result = model_iter_fn(
                 copy.deepcopy(model), torchdynamo.utils.clone_inputs(example_inputs)
@@ -678,7 +691,6 @@ class BenchmarkRunner:
 
             torch.manual_seed(1337)
             torchdynamo.reset()
-
             if experiment.func is cold_start_experiment:
                 results = []
                 results.append(experiment(model, example_inputs, optimize_ctx))
@@ -765,11 +777,15 @@ def parse_args():
         "--nvfuser", action="store_true", help="enable nvfuser globally"
     )
     parser.add_argument(
+        "--prims-nvfuser", action="store_true", help="user prims + nvfuser backend"
+    )
+    parser.add_argument(
         "--isolate", action="store_true", help="run each model in its own process"
     )
 
     parser.add_argument("--float16", action="store_true", help="cast model to fp16")
     parser.add_argument("--float32", action="store_true", help="cast model to fp32")
+    parser.add_argument("--batch_size", type=int, help="batch size for benchmarking")
     parser.add_argument(
         "--amp", action="store_true", help="use automatic mixed precision"
     )
@@ -802,11 +818,6 @@ def parse_args():
         help="Generates AOT Autograd stats like how mnay graphs are sent to AOT",
     )
     parser.add_argument(
-        "--disable-functionalization",
-        action="store_true",
-        help="Disables functionalization",
-    )
-    parser.add_argument(
         "--inductor-settings",
         action="store_true",
         help="Use same settings as --inductor for baseline comparisons",
@@ -815,6 +826,10 @@ def parse_args():
         "--raise-on-backend-error",
         action="store_true",
         help="Fail a benchmark if backend throws an exception",
+    )
+    parser.add_argument(
+        "--output",
+        help="Overides the output filename",
     )
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
@@ -863,6 +878,11 @@ def parse_args():
     )
     group.add_argument(
         "--speedup-trt", action="store_true", help=help(speedup_experiment_trt)
+    )
+    group.add_argument(
+        "--speedup-dynamo-ts",
+        action="store_true",
+        help="TorchDynamo frontend with torchscript backend",
     )
     group.add_argument("--python-key", action="store_true")
     group.add_argument(
@@ -1012,9 +1032,6 @@ def main(runner, original_dir=None):
         if args.float16:
             # TODO(jansel): check if correctness issue is real
             runner.skip_models.add("yolov3")
-        if not (args.float16 or args.float32):
-            # https://github.com/openai/triton/issues/543 causes only 98.8% similarity
-            runner.non_deterministic_models.add("pyhpc_equation_of_state")
         if args.training:
             # dropout,etc makes results not match
             args.skip_accuracy_check = True
@@ -1066,14 +1083,7 @@ def main(runner, original_dir=None):
         else:
             torchinductor.config.dynamic_shapes = False
 
-        if args.training:
-            from torchinductor.compile_fx import compile_fx_training
-
-            optimize_ctx = torchdynamo.optimize(
-                compile_fx_training, nopython=args.nopython
-            )
-        else:
-            optimize_ctx = torchdynamo.optimize("inductor", nopython=args.nopython)
+        optimize_ctx = torchdynamo.optimize("inductor", nopython=args.nopython)
         experiment = speedup_experiment
         output_filename = "inductor.csv"
     elif args.online_autotune:
@@ -1128,6 +1138,10 @@ def main(runner, original_dir=None):
     elif args.speedup_trt:
         experiment = speedup_experiment_trt
         output_filename = "baseline_trt.csv"
+    elif args.speedup_dynamo_ts:
+        optimize_ctx = torchdynamo.optimize(backends.ts, nopython=args.nopython)
+        experiment = speedup_experiment
+        output_filename = "speedup_dynamo_ts.csv"
     elif args.speedup_fx2trt:
         optimize_ctx = torchdynamo.optimize(
             backends.fx2trt_compiler, nopython=args.nopython
@@ -1167,6 +1181,13 @@ def main(runner, original_dir=None):
         experiment = speedup_experiment
         backend_str = "nvfuser" if args.nvfuser else "nnc"
         output_filename = f"accuracy_aot_{backend_str}_mincut.csv"
+    elif args.prims_nvfuser:
+        optimize_ctx = torchdynamo.optimize(
+            aot_autograd_prims_nvfuser_strategy, nopython=args.nopython
+        )
+        experiment = speedup_experiment
+        backend_str = "prims_nvfuser"
+        output_filename = f"accuracy_aot_{backend_str}.csv"
     elif args.print_fx:
         optimize_ctx = torchdynamo.optimize(
             print_fx,
@@ -1208,13 +1229,11 @@ def main(runner, original_dir=None):
 
     experiment = functools.partial(experiment, args, model_iter_fn)
 
-    cos_similarity = args.cosine
+    if args.output:
+        output_filename = args.output
 
     if output_filename:
         output_filename = os.path.join(torchdynamo.config.base_dir, output_filename)
-
-    if args.disable_functionalization:
-        torchdynamo.config.normalize_ir = False
 
     if args.minimum_call_count:
         torchdynamo.config.minimum_call_count = args.minimum_call_count
@@ -1222,7 +1241,11 @@ def main(runner, original_dir=None):
         for device in args.devices:
             try:
                 device, name, model, example_inputs = runner.load_model(
-                    device, args.only, args.training, args.use_eval_mode
+                    device,
+                    args.only,
+                    args.training,
+                    args.use_eval_mode,
+                    args.batch_size,
                 )
             except NotImplementedError:
                 continue  # bad benchmark implementation
@@ -1242,11 +1265,10 @@ def main(runner, original_dir=None):
                 example_inputs,
                 optimize_ctx,
                 experiment,
-                cos_similarity,
                 args.skip_accuracy_check,
             )
-        stats_file = output_filename.split(".csv")[0] + "_stats.csv"
         if args.generate_aot_autograd_stats:
+            stats_file = output_filename.split(".csv")[0] + "_stats.csv"
             output_csv(
                 stats_file,
                 ("dev", "name", "total_aot_graphs", "ok_aot_graphs"),
@@ -1287,7 +1309,6 @@ def main(runner, original_dir=None):
                 example_inputs,
                 optimize_ctx,
                 experiment,
-                cos_similarity,
                 args.skip_accuracy_check,
             )
 

@@ -22,6 +22,7 @@ torch.backends.cuda.matmul.allow_tf32 = True
 
 os.environ["KALDI_ROOT"] = "/tmp"  # avoids some spam
 for torchbench_dir in (
+    "./torchbenchmark",
     "../torchbenchmark",
     "../torchbench",
     "../benchmark",
@@ -48,6 +49,20 @@ USE_SMALL_BATCH_SIZE = {
 }
 
 
+DETECTRON2_MODELS = {
+    "detectron2_fasterrcnn_r_101_c4",
+    "detectron2_fasterrcnn_r_101_dc5",
+    "detectron2_fasterrcnn_r_101_fpn",
+    "detectron2_fasterrcnn_r_50_c4",
+    "detectron2_fasterrcnn_r_50_dc5",
+    "detectron2_fasterrcnn_r_50_fpn",
+    "detectron2_maskrcnn_r_101_c4",
+    "detectron2_maskrcnn_r_101_fpn",
+    "detectron2_maskrcnn_r_50_c4",
+    "detectron2_maskrcnn_r_50_fpn",
+}
+
+
 # Additional models that are skipped in training
 SKIP_TRAIN = {
     # not designed for training
@@ -58,6 +73,8 @@ SKIP_TRAIN = {
     "opacus_cifar10",
     "maml",
 }
+SKIP_TRAIN.update(DETECTRON2_MODELS)
+
 
 # Some models have bad train dataset. We read eval dataset.
 # yolov3 - seems to have different number of inputs between eval and train
@@ -68,7 +85,7 @@ ONLY_EVAL_DATASET = {"yolov3", "timm_efficientdet"}
 # These models support only train mode. So accuracy checking can't be done in
 # eval mode.
 ONLY_TRAINING_MODE = {"tts_angular", "tacotron2", "demucs"}
-
+ONLY_TRAINING_MODE.update(DETECTRON2_MODELS)
 
 # Need lower tolerance on GPU. GPU kernels have non deterministic kernels for these models.
 REQUIRE_HIGHER_TOLERANCE = {
@@ -97,6 +114,10 @@ REQUIRE_EVEN_HIGHER_TOLERANCE = {
     "tacotron2",
 }
 
+REQUIRE_COSINE_TOLERACE = {
+    # https://github.com/pytorch/torchdynamo/issues/556
+    "resnet50_quantized_qat",
+}
 
 # non-deterministic output / cant check correctness
 NONDETERMINISTIC = set()
@@ -126,39 +147,50 @@ SLOW_BENCHMARKS = {
     "vision_maskrcnn",  # 99s
 }
 
-# https://github.com/pytorch/torchdynamo/issues/331
-PYTHON_KEY_NOT_YET_WORKING = {
-    # RuntimeError: expected scalar type Half but found Float
+# https://github.com/pytorch/torchdynamo/issues/519
+AOT_AUTOGRAD_NOT_YET_WORKING = {
+    # https://github.com/pytorch/functorch/issues/586
+    "tts_angular",
+    "demucs",
+    "tacotron2",  # also has an issue with normalize_ir
+    # https://github.com/pytorch/torchdynamo/issues/590
+    "pyhpc_isoneutral_mixing",
+    # https://github.com/pytorch/torchdynamo/issues/80
     "hf_BigBird",
-    # AttributeError: 'int' object has no attribute 'proxy'
+    # https://github.com/pytorch/pytorch/issues/81526
     "moco",
-    # AttributeError: 'Tensor' object has no attribute 'proxy'
+    # https://github.com/pytorch/pytorch/issues/81529
     "speech_transformer",
-    # torch.fx.proxy.TraceError: symbolically traced variables cannot be used as inputs to control flow
-    "tacotron2",
-    # requires training mode
-    "maml",
 }
 
-
 # https://github.com/pytorch/torchdynamo/issues/332
-TORCHINDUCTOR_NOT_YET_WORKING = {
-    *PYTHON_KEY_NOT_YET_WORKING,
-    # Crash with no warning message
-    "Super_SloMo",
+INDUCTOR_INFERENCE_NOT_YET_WORKING = {
+    *AOT_AUTOGRAD_NOT_YET_WORKING,
+    # ValueError: tmpX is not defined
     "fastNLP_Bert",
-    # RuntimeError: CUDA: Error- invalid value
-    "dlrm",
     "vision_maskrcnn",
-    # LLVM ERROR: Broken function found, compilation aborted!
-    # torch.randn missing
+    "maml",
+    # missing ops: argmax, scatter
     "hf_Reformer",
     # as_strided issue
     "hf_Longformer",
-    # out of memory
+    # RuntimeError: CUDA out of memory.
     "timm_efficientdet",
 }
 
+
+INDUCTOR_TRAINING_NOT_YET_WORKING = {
+    *INDUCTOR_INFERENCE_NOT_YET_WORKING,
+    # load_mask nesting needed
+    "Super_SloMo",
+    # float16 issue or CUDA error: operation not permitted when stream is capturing
+    "resnet50_quantized_qat",
+    "mobilenet_v2_quantized_qat",
+    # TypeError: expected Tensor as element 0 in argument 1, but got NoneType
+    "dlrm",
+    # RuntimeError: CUDA out of memory.
+    "Background_Matting",
+}
 
 TRT_NOT_YET_WORKING = {
     "alexnet",
@@ -209,11 +241,14 @@ class TorchBenchmarkRunner(BenchmarkRunner):
 
     @property
     def failing_python_key_models(self):
-        return PYTHON_KEY_NOT_YET_WORKING
+        return AOT_AUTOGRAD_NOT_YET_WORKING | {"maml_omniglot", "moco"}
 
     @property
     def failing_torchinductor_models(self):
-        return TORCHINDUCTOR_NOT_YET_WORKING
+        if self.args.training:
+            return INDUCTOR_TRAINING_NOT_YET_WORKING
+        else:
+            return INDUCTOR_INFERENCE_NOT_YET_WORKING
 
     @property
     def failing_fx2trt_models(self):
@@ -223,12 +258,13 @@ class TorchBenchmarkRunner(BenchmarkRunner):
     def failing_dynamic_shape_models(self):
         return DYNAMIC_SHAPES_NOT_YET_WORKING
 
-    def load_model(self, device, model_name, is_training, use_eval_mode):
+    def load_model(
+        self, device, model_name, is_training, use_eval_mode, batch_size=None
+    ):
         module = importlib.import_module(f"torchbenchmark.models.{model_name}")
         benchmark_cls = getattr(module, "Model", None)
         if not hasattr(benchmark_cls, "name"):
             benchmark_cls.name = model_name
-        batch_size = None
         if is_training and model_name in USE_SMALL_BATCH_SIZE:
             batch_size = USE_SMALL_BATCH_SIZE[model_name]
 
@@ -258,7 +294,11 @@ class TorchBenchmarkRunner(BenchmarkRunner):
             for device in args.devices:
                 try:
                     yield self.load_model(
-                        device, model_name, args.training, args.use_eval_mode
+                        device,
+                        model_name,
+                        args.training,
+                        args.use_eval_mode,
+                        args.batch_size,
                     )
                 except NotImplementedError:
                     continue  # bad benchmark implementation
@@ -283,22 +323,20 @@ class TorchBenchmarkRunner(BenchmarkRunner):
         else:
             return torch.no_grad()
 
-    def get_tolerance(self, is_training, current_device, name):
+    def get_tolerance_and_cosine_flag(self, is_training, current_device, name):
         tolerance = 1e-4
+        cosine = self.args.cosine
         # Increase the tolerance for torch allclose
-        if (
-            is_training
-            and current_device == "cuda"
-            and name in REQUIRE_HIGHER_TOLERANCE
-        ):
-            tolerance = 1e-3
-        elif (
-            is_training
-            and current_device == "cuda"
-            and name in REQUIRE_EVEN_HIGHER_TOLERANCE
-        ):
-            tolerance = 8 * 1e-3
-        return tolerance
+        if self.args.float16:
+            return 1e-3, cosine
+        if is_training and current_device == "cuda":
+            if name in REQUIRE_COSINE_TOLERACE:
+                cosine = True
+            elif name in REQUIRE_HIGHER_TOLERANCE:
+                tolerance = 1e-3
+            elif name in REQUIRE_EVEN_HIGHER_TOLERANCE:
+                tolerance = 8 * 1e-3
+        return tolerance, cosine
 
     def compute_loss(self, pred):
         return reduce_to_scalar_loss(pred)

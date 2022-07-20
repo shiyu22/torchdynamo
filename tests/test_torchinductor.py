@@ -126,7 +126,11 @@ class InputGen:
         return torch.arange(self.n, device=self.device, dtype=torch.int32)
 
 
+@patch.object(torchinductor.config.triton, "cudagraphs", False)
+@patch("torchdynamo.config.raise_on_backend_error", True)
 def check_model(self: TestCase, model, example_inputs, tol=1e-4, check_lowp=True):
+    torchdynamo.reset()
+
     # check_lowp is ignored here, it's kept just to be able to call `common` with extra arg
     has_lowp_args = False
 
@@ -153,14 +157,12 @@ def check_model(self: TestCase, model, example_inputs, tol=1e-4, check_lowp=True
 
     torchinductor.metrics.reset()
 
-    @torchdynamo.optimize_assert(functools.partial(compile_fx, cudagraphs=False))
+    @torchdynamo.optimize_assert(compile_fx)
     def run(*ex):
         return model(*ex)
 
-    torchdynamo.reset()
-    with unittest.mock.patch("torchdynamo.config.raise_on_backend_error", True):
-        torch.manual_seed(0)
-        actual = run(*example_inputs)
+    torch.manual_seed(0)
+    actual = run(*example_inputs)
 
     assert type(actual) == type(correct)
     correct_flat, correct_spec = tree_flatten(correct)
@@ -170,9 +172,14 @@ def check_model(self: TestCase, model, example_inputs, tol=1e-4, check_lowp=True
         for x, y in zip(actual_flat, correct_flat)
     )
     correct = tree_unflatten(correct_flat, correct_spec)
+
+    # print(correct)
+    # print(actual)
+    # print(correct - actual)
     self.assertTrue(same(actual, correct, tol=tol, equal_nan=True))
 
 
+@patch.object(torchinductor.config.triton, "cudagraphs", False)
 def check_model_cuda(self: TestCase, model, example_inputs, check_lowp=True):
     if hasattr(model, "to"):
         model = model.to("cuda")
@@ -603,6 +610,23 @@ class CommonTemplate:
         # with *100 we are always getting a number exactly at .5 which we don't do right in half
         self.common(fn, (torch.randn(8, 8) * 100, torch.randn(8, 8) * 10))
 
+    def test_round_correctness(self):
+        if self.device == "cuda" and (
+            not torchinductor.utils.has_triton_libdevice()
+            # TODO(jansel): need to debug issue on V100 cards
+            or torch.cuda.get_device_capability() < (8,)
+        ):
+            raise unittest.SkipTest("requires triton.language.libdevice")
+
+        def fn(a):
+            return torch.round(a)
+
+        self.common(
+            fn,
+            [torch.arange(-10, 10, 0.1, dtype=torch.float64)],
+            check_lowp=False,
+        )
+
     def test_silu(self):
         def fn(a):
             return (torch.nn.functional.silu(a),)
@@ -726,6 +750,7 @@ class CommonTemplate:
             ),
         )
 
+    @patch.object(config, "aot_autograd", False)
     def test_unsqueeze_inplace(self):
         def fn(a):
             tmp1 = a + 1
@@ -758,6 +783,7 @@ class CommonTemplate:
             ),
         )
 
+    @patch.object(config, "aot_autograd", False)
     def test_linear1(self):
         mod = torch.nn.Sequential(
             torch.nn.Linear(8, 16),
@@ -766,6 +792,7 @@ class CommonTemplate:
         )
         self.common(mod, (torch.randn(2, 8),))
 
+    @patch.object(config, "aot_autograd", False)
     def test_linear2(self):
         mod = torch.nn.Sequential(
             torch.nn.Linear(8, 8),
@@ -1136,6 +1163,15 @@ class CommonTemplate:
             (torch.randn([16, 16]),),
         )
 
+    def test_sin(self):
+        def fn(x):
+            return aten.sin(x) + 2, aten.sin(x + 1)
+
+        self.common(
+            fn,
+            (torch.randn([16, 16]),),
+        )
+
     def test_repeat(self):
         def fn(x):
             return (
@@ -1201,6 +1237,7 @@ class CommonTemplate:
 
     @requires_cuda()
     @patch.object(config.triton, "convolution", "triton")
+    @patch.object(config.triton, "dense_indexing", "True")
     def test_triton_conv(self):
         @torchdynamo.optimize("inductor", nopython=True)
         def triton_conv(
@@ -1227,6 +1264,7 @@ class CommonTemplate:
 
     @requires_cuda()
     @patch.object(config.triton, "convolution", "autotune")
+    @patch.object(config.triton, "dense_indexing", "True")
     def test_conv_autotune(self):
         @torchdynamo.optimize("inductor", nopython=True)
         def triton_conv(
@@ -1439,6 +1477,15 @@ class CommonTemplate:
             (torch.randn([8, 8]) + 10,),
         )
 
+    def test_log_fp64(self):
+        def fn(x):
+            return torch.log(x), torch.log2(x)
+
+        self.common(
+            fn,
+            (torch.randn([1024], dtype=torch.float64) + 10,),
+        )
+
     def test_bitwise(self):
         def fn(x, y):
             return (
@@ -1513,6 +1560,7 @@ class CommonTemplate:
 
         self.common(fn, (torch.randn(8),))
 
+    @patch.object(config, "aot_autograd", False)
     def test_new_ones(self):
         def fn(a):
             return (
@@ -1761,6 +1809,7 @@ class CommonTemplate:
 
         self.common(fn, (torch.randn([8, 1, 1]),))
 
+    @patch.object(config, "aot_autograd", False)
     @patch.object(config.triton, "cudagraphs", True)
     def test_input_mutation1(self):
         def fn(a):
@@ -1784,6 +1833,7 @@ class CommonTemplate:
         self.assertTrue(same(arg1, arg2))
         self.assertTrue(same(arg3, arg4))
 
+    @patch.object(config, "aot_autograd", False)
     def test_input_mutation2(self):
         def fn(a):
             b = a + 1
@@ -1800,6 +1850,7 @@ class CommonTemplate:
         self.assertTrue(same(actual1, correct1))
         self.assertTrue(same(arg1, arg2))
 
+    @patch.object(config, "aot_autograd", False)
     def test_input_mutation3(self):
         def fn(a):
             a += 1
@@ -1820,6 +1871,7 @@ class CommonTemplate:
         self.assertTrue(same(actual1, correct1))
         self.assertTrue(same(arg1, arg2))
 
+    @patch.object(config, "aot_autograd", False)
     def test_slice_mutation1(self):
         def fn(a):
             x = torch.zeros_like(a)
@@ -1832,6 +1884,7 @@ class CommonTemplate:
 
         self.common(fn, (torch.randn([8, 8]),))
 
+    @patch.object(config, "aot_autograd", False)
     def test_slice_mutation2(self):
         def fn(a):
             a[:, 20:40] = a[:, 20:40] + 1
@@ -1890,6 +1943,15 @@ class CommonTemplate:
         self.common(
             fn, [torch.tensor([1, float("inf"), 2, float("-inf"), float("nan")])]
         )
+        self.common(
+            fn,
+            [
+                torch.tensor(
+                    [1, float("inf"), 2, float("-inf"), float("nan")],
+                    dtype=torch.float64,
+                )
+            ],
+        )
 
     def test_any(self):
         def fn(x):
@@ -1905,6 +1967,7 @@ class CommonTemplate:
         tmp[1, 1] = float("inf")
         self.common(fn, [tmp])
 
+    @patch.object(config, "aot_autograd", False)
     def test_inplace_activations(self):
         def fn(x):
             a = aten.hardswish_(x + 1)
@@ -2054,6 +2117,49 @@ class CommonTemplate:
             ],
         )
 
+    @unittest.skip("Triton kernel fails when xnumel == 1")
+    def test_scatter_add1(self):
+        def fn(a, dim, index, b):
+            return aten.scatter_add(a, dim, index, b)
+
+        self.common(
+            fn,
+            [
+                torch.randn(2, 3),
+                0,
+                torch.tensor([[0]]),
+                torch.randn(2, 3),
+            ],
+        )
+
+    def test_scatter_add2(self):
+        def fn(a, dim, index, b):
+            return aten.scatter_add(a, dim, index, b)
+
+        self.common(
+            fn,
+            [
+                torch.randn(2, 3),
+                0,
+                torch.tensor([[0, 0, 0], [1, 1, 1]]),
+                torch.randn(2, 3),
+            ],
+        )
+
+    def test_scatter_add3(self):
+        def fn(a, dim, index, b):
+            return aten.scatter_add(a, dim, index, b)
+
+        self.common(
+            fn,
+            [
+                torch.randn(5, 29, 13),
+                2,
+                torch.tensor([[[3, 5, 7, 9]]]),
+                torch.randn(1, 1, 10),
+            ],
+        )
+
     def test_new_empty_strided(self):
         def fn(a):
             return aten.new_empty_strided(a, [1, 128, 128], [16384, 128, 1]).fill_(123)
@@ -2074,6 +2180,7 @@ class CommonTemplate:
         self.assertTrue(400 < result.nonzero().shape[0] < 600)
         self.assertTrue(0.9 < result.mean().item() < 1.1)
 
+    @patch.object(config, "aot_autograd", False)
     def test_dropout_deterministic(self):
         if self.device == "cpu":
             # TODO(jansel): CPU RNG is not yet deterministic
@@ -2107,6 +2214,98 @@ class CommonTemplate:
                 # different calls, different values
                 self.assertFalse(torch.allclose(a0, a1))
                 self.assertFalse(torch.allclose(a1, a2))
+
+    def test_max_pool2d_with_indices_backward(self):
+        def fn(a, b, c):
+            return aten.max_pool2d_with_indices_backward(
+                a, b, [2, 2], [2, 2], [0, 0], [1, 1], False, c
+            )
+
+        x = torch.randn([2, 4, 18, 14])
+        result, indices = aten.max_pool2d_with_indices(
+            x,
+            [2, 2],
+            [2, 2],
+            [0, 0],
+            [1, 1],
+            False,
+        )
+
+        self.common(
+            fn,
+            [
+                torch.randn_like(result),
+                x,
+                indices,
+            ],
+        )
+
+    def test_max_pool2d_with_indices_backward2(self):
+        def fn(a, b, c):
+            return aten.max_pool2d_with_indices_backward(
+                a, b, [3, 3], [2, 2], [1, 1], [1, 1], True, c
+            )
+
+        x = torch.randn([2, 4, 40, 56])
+        result, indices = aten.max_pool2d_with_indices(
+            x,
+            [3, 3],
+            [2, 2],
+            [1, 1],
+            [1, 1],
+            True,
+        )
+
+        self.common(
+            fn,
+            [
+                torch.randn_like(result),
+                x,
+                indices,
+            ],
+        )
+
+    def test_avg_pool2d_backward(self):
+        def fn(a, b):
+            return aten.avg_pool2d_backward(
+                a,
+                b,
+                [2, 2],
+                [2, 2],
+                [0, 0],
+                True,
+                False,
+                None,
+            )
+
+        self.common(
+            fn,
+            [
+                torch.randn([2, 4, 7, 7]),
+                torch.randn([2, 4, 14, 14]),
+            ],
+        )
+
+    def test_avg_pool2d_backward2(self):
+        def fn(a, b):
+            return aten.avg_pool2d_backward(
+                a,
+                b,
+                [3, 3],
+                [1, 1],
+                [1, 1],
+                True,
+                False,
+                None,
+            )
+
+        self.common(
+            fn,
+            [
+                torch.randn([1, 1, 20, 15]),
+                torch.randn([1, 1, 20, 15]),
+            ],
+        )
 
 
 if HAS_CPU:

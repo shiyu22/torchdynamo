@@ -430,6 +430,18 @@ def tuple_iterator_getitem(it, index):
     return obj[start + index]
 
 
+def dict_param_key_ids(value):
+    return set([id(k) for k in value.keys() if isinstance(k, torch.nn.Parameter)])
+
+
+def dict_const_keys(value):
+    return set(k for k in value.keys() if not isinstance(k, torch.nn.Parameter))
+
+
+def global_key_name(key):
+    return f"__dict_key_{id(key)}"
+
+
 def rename_implicit(v):
     """
     Usage of inline comprehensions generates a implicit ".0" variable that
@@ -501,6 +513,9 @@ def same(a, b, cos_similarity=False, tol=1e-4, equal_nan=False):
             a = a.flatten().to(torch.float32)
             b = b.flatten().to(torch.float32)
             res = torch.nn.functional.cosine_similarity(a, b, dim=0, eps=1e-6)
+            if res.isnan() or res == 0:
+                # Fallback to use torch.allcose
+                return torch.allclose(a, b, atol=tol, rtol=tol, equal_nan=equal_nan)
             if res < 0.99:
                 print(f"Similarity score={res.cpu().detach().item()}")
             return res >= 0.99
